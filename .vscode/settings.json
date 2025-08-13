@@ -1,0 +1,13 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.espIdfPathWin": "C:\\Users\\payno\\esp\\v5.4.1\\esp-idf",
+  "idf.toolsPathWin": "C:\\Users\\payno\\.espressif",
+  "idf.pythonInstallPath": "/usr/bin/python",
+  "idf.portWin": "COM3",
+  "idf.flashType": "UART",
+  "files.associations": {
+    "font8x8_basic.h": "c",
+    "uart.h": "c"
+  },
+  "idf.port": "/dev/ttyUSB0"
+}
