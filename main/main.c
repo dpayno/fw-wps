@@ -35,6 +35,8 @@ const static char *TAG = "WPS";
 #define ADC_VALUE_MAX               4095
 #define PRESSURE_MIN_PA             0
 #define PRESSURE_MAX_PA             1200000
+#define PRESSURE_M                  116.59f
+#define PRESSURE_N                  41.687f
 
 /* Static ADC calibration values for pressure sensor
     Vout,adc = Vin × (R2 / (R1 + R2))
@@ -42,8 +44,7 @@ const static char *TAG = "WPS";
     Vmin = 0.5V → Vadc,min = 0.5 × 0.66 = 0.33V
     Vmax = 4.5V → Vadc,max = 4.5 × 0.66 = 2.97V
 */
-// #define ADC_MIN    410    // Vmin,adc = 0.5V (0 MPa) --> ADCmin = 0.33V / 3.3V × 4095 ≈ 410
-#define ADC_MIN    0    // Vmin,adc = 0.5V (0 MPa) --> ADCmin = 0.33V / 3.3V × 4095 ≈ 410
+#define ADC_MIN    410    // Vmin,adc = 0.5V (0 MPa) --> ADCmin = 0.33V / 3.3V × 4095 ≈ 410
 #define ADC_MAX    3687   // Vmax,adc = 4.5V (1.2 MPa) --> ADCmax = 2.97V / 3.3V × 4095 ≈ 3687
 #define PRESSURE_MAX_MPA 1.2f
 
@@ -54,7 +55,9 @@ static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel,
 static void example_adc_calibration_deinit(adc_cali_handle_t handle);
 static float adc_raw_to_mpa(int raw);
 static float mpa_to_bar(float mpa);
+static float adc_raw_to_bar(int raw);
 
+// Deprecated in favor of adc_raw_to_bar()
 static float adc_raw_to_mpa(int raw)
 {
     if (raw < ADC_MIN) raw = ADC_MIN;
@@ -62,9 +65,20 @@ static float adc_raw_to_mpa(int raw)
     return ((float)(raw - ADC_MIN) * PRESSURE_MAX_MPA) / (ADC_MAX - ADC_MIN);
 }
 
+// Deprecated in favor of adc_raw_to_bar()
 static float mpa_to_bar(float mpa)
 {
     return mpa * 10.0f;
+}
+
+static float adc_raw_to_bar(int raw)
+{
+    // Convert ADC raw to pressure in Bar using linear equation from calibration
+    float result = (raw - PRESSURE_N) / PRESSURE_M;
+    if (result < 0.0f) {
+        result = 0.0f;
+    }
+    return result;
 }
 
 void app_main(void)
@@ -118,7 +132,8 @@ void app_main(void)
         }
         adc_raw = sum / 10;
         // ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, EXAMPLE_ADC1_CHAN0, adc_raw);
-        pressure_bar = mpa_to_bar(adc_raw_to_mpa(adc_raw));
+        pressure_bar = adc_raw_to_bar(adc_raw);
+        // pressure_bar = mpa_to_bar(adc_raw_to_mpa(adc_raw));
 
         //-------------Send value via UART---------------//
         char uart_msg[32];
