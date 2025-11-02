@@ -6,8 +6,10 @@
   "idf.portWin": "COM3",
   "idf.flashType": "UART",
   "files.associations": {
+    "*.paths": "makefile",
     "font8x8_basic.h": "c",
-    "uart.h": "c"
+    "uart.h": "c",
+    "ssd1306.h": "c"
   },
   "idf.port": "/dev/ttyUSB0"
 }

@@ -1,42 +1,56 @@
 /*
- * SPDX-FileCopyrightText: 2022-2023 Espressif Systems (Shanghai) CO LTD
+ * WPS - Water Pressure Sensor
  *
- * SPDX-License-Identifier: Apache-2.0
+ * This application reads pressure data from a water pressure sensor
+ * connected to an ADC channel, displays the readings on an SSD1306 OLED
+ * display, and stores it in a SD card.
+ *
  */
-#include <stdio.h>
+
+/* Standard libraries */
+ #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/unistd.h>
+#include <sys/stat.h>
+
+/* ESP-IDF libraries */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "soc/soc_caps.h"
 #include "esp_log.h"
+
+/* ADC */
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
-#include "driver/uart.h"
 
+/* Display */
 #include "ssd1306.h"
-// #include "font8x8_basic.h"
+
+/* SD card */
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
 
 const static char *TAG = "WPS";
 
 /*---------------------------------------------------------------
         ADC General Macros
 ---------------------------------------------------------------*/
-//ADC1 Channels
+// ADC1 Channels
 #if CONFIG_IDF_TARGET_ESP32
-#define EXAMPLE_ADC1_CHAN0          ADC_CHANNEL_4
+#define EXAMPLE_ADC1_CHAN0    ADC_CHANNEL_4
 #else
-#define EXAMPLE_ADC1_CHAN0          ADC_CHANNEL_2
+#define EXAMPLE_ADC1_CHAN0    ADC_CHANNEL_2
 #endif
 
-#define EXAMPLE_ADC_ATTEN           ADC_ATTEN_DB_12
+#define EXAMPLE_ADC_ATTEN     ADC_ATTEN_DB_12
 
-#define ADC_VALUE_MAX               4095
-#define PRESSURE_MIN_PA             0
-#define PRESSURE_MAX_PA             1200000
-#define PRESSURE_M                  116.59f
-#define PRESSURE_N                  41.687f
+#define ADC_VALUE_MAX         4095
+#define PRESSURE_MIN_PA       0
+#define PRESSURE_MAX_PA       1200000
+#define PRESSURE_M            128.84f
+#define PRESSURE_N            4.7915f
 
 /* Static ADC calibration values for pressure sensor
     Vout,adc = Vin × (R2 / (R1 + R2))
@@ -44,33 +58,37 @@ const static char *TAG = "WPS";
     Vmin = 0.5V → Vadc,min = 0.5 × 0.66 = 0.33V
     Vmax = 4.5V → Vadc,max = 4.5 × 0.66 = 2.97V
 */
-#define ADC_MIN    410    // Vmin,adc = 0.5V (0 MPa) --> ADCmin = 0.33V / 3.3V × 4095 ≈ 410
-#define ADC_MAX    3687   // Vmax,adc = 4.5V (1.2 MPa) --> ADCmax = 2.97V / 3.3V × 4095 ≈ 3687
-#define PRESSURE_MAX_MPA 1.2f
+#define ADC_MIN               410    // Vmin,adc = 0.5V (0 MPa) --> ADCmin = 0.33V / 3.3V × 4095 ≈ 410
+#define ADC_MAX               3687   // Vmax,adc = 4.5V (1.2 MPa) --> ADCmax = 2.97V / 3.3V × 4095 ≈ 3687
+#define PRESSURE_MAX_MPA      1.2f
 
+/*---------------------------------------------------------------
+        SD Card General Macros
+---------------------------------------------------------------*/
+#define EXAMPLE_MAX_CHAR_SIZE 64
+#define MOUNT_POINT           "/sdcard"
+
+#define PIN_NUM_MISO          19
+#define PIN_NUM_MOSI          23
+#define PIN_NUM_CLK           18
+#define PIN_NUM_CS            2
+
+/*---------------------------------------------------------------
+        Global Variables
+---------------------------------------------------------------*/
 static int adc_raw;
 static float pressure_bar;
 
-static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle);
-static void example_adc_calibration_deinit(adc_cali_handle_t handle);
-static float adc_raw_to_mpa(int raw);
-static float mpa_to_bar(float mpa);
+/*---------------------------------------------------------------
+        Function Prototypes
+---------------------------------------------------------------*/
 static float adc_raw_to_bar(int raw);
+static esp_err_t write_file(const char *path, char *data);
+static esp_err_t read_file(const char *path);
 
-// Deprecated in favor of adc_raw_to_bar()
-static float adc_raw_to_mpa(int raw)
-{
-    if (raw < ADC_MIN) raw = ADC_MIN;
-    if (raw > ADC_MAX) raw = ADC_MAX;
-    return ((float)(raw - ADC_MIN) * PRESSURE_MAX_MPA) / (ADC_MAX - ADC_MIN);
-}
-
-// Deprecated in favor of adc_raw_to_bar()
-static float mpa_to_bar(float mpa)
-{
-    return mpa * 10.0f;
-}
-
+/*---------------------------------------------------------------
+        Function Definitions
+---------------------------------------------------------------*/
 static float adc_raw_to_bar(int raw)
 {
     // Convert ADC raw to pressure in Bar using linear equation from calibration
@@ -81,6 +99,46 @@ static float adc_raw_to_bar(int raw)
     return result;
 }
 
+static esp_err_t write_file(const char *path, char *data)
+{
+    ESP_LOGI(TAG, "Opening file %s", path);
+    FILE *f = fopen(path, "w");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for writing");
+        return ESP_FAIL;
+    }
+    fprintf(f, data);
+    fclose(f);
+    ESP_LOGI(TAG, "File written");
+
+    return ESP_OK;
+}
+
+static esp_err_t read_file(const char *path)
+{
+    ESP_LOGI(TAG, "Reading file %s", path);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for reading");
+        return ESP_FAIL;
+    }
+    char line[EXAMPLE_MAX_CHAR_SIZE];
+    fgets(line, sizeof(line), f);
+    fclose(f);
+
+    // strip newline
+    char *pos = strchr(line, '\n');
+    if (pos) {
+        *pos = '\0';
+    }
+    ESP_LOGI(TAG, "Read from file: '%s'", line);
+
+    return ESP_OK;
+}
+
+/*---------------------------------------------------------------
+        Application Main
+---------------------------------------------------------------*/
 void app_main(void)
 {
     //-------------SSD1306 Init---------------//
@@ -91,36 +149,118 @@ void app_main(void)
     ssd1306_clear_screen(&dev, false);
     ssd1306_contrast(&dev, 0xff);
 
-    //-------------UART0 Init---------------//
-    const uart_port_t uart_num = UART_NUM_0;
-    uart_config_t uart_config = {
-        .baud_rate = 9600,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
-    };
-    uart_driver_install(uart_num, 1024, 0, 0, NULL, 0);
-    uart_param_config(uart_num, &uart_config);
-    uart_set_pin(uart_num, 1, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE); // TXD0 = GPIO14
-
-    //-------------ADC1 Init---------------//
+    //-------------ADC1 Init & Config---------------//
     adc_oneshot_unit_handle_t adc1_handle;
     adc_oneshot_unit_init_cfg_t init_config1 = {
         .unit_id = ADC_UNIT_1,
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
 
-    //-------------ADC1 Config---------------//
     adc_oneshot_chan_cfg_t config = {
         .atten = EXAMPLE_ADC_ATTEN,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, EXAMPLE_ADC1_CHAN0, &config));
 
-    //-------------ADC1 Calibration Init---------------//
-    adc_cali_handle_t adc1_cali_chan0_handle = NULL;
-    bool do_calibration1_chan0 = example_adc_calibration_init(ADC_UNIT_1, EXAMPLE_ADC1_CHAN0, EXAMPLE_ADC_ATTEN, &adc1_cali_chan0_handle);
+    //-------------SD card init & test---------------//
+    esp_err_t ret;
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+    sdmmc_card_t *card;
+    const char mount_point[] = MOUNT_POINT;
+    ESP_LOGI(TAG, "Initializing SD card");
+    ESP_LOGI(TAG, "Using SPI peripheral");
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = PIN_NUM_MOSI,
+        .miso_io_num = PIN_NUM_MISO,
+        .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+    ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize bus.");
+        return;
+    }
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = PIN_NUM_CS;
+    slot_config.host_id = host.slot;
+
+    ESP_LOGI(TAG, "Mounting filesystem");
+    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
+
+    if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
+            ESP_LOGE(TAG, "Failed to mount filesystem. "
+                     "If you want the card to be formatted, set the CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED menuconfig option.");
+        } else {
+            ESP_LOGE(TAG, "Failed to initialize the card (%s). "
+                     "Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
+#ifdef CONFIG_EXAMPLE_DEBUG_PIN_CONNECTIONS
+            check_sd_card_pins(&config, pin_count);
+#endif
+        }
+        return;
+    }
+    ESP_LOGI(TAG, "Filesystem mounted");
+
+    // Card has been initialized, print its properties
+    sdmmc_card_print_info(stdout, card);
+
+    // First create a file.
+    const char *file_hello = MOUNT_POINT"/hello.txt";
+    char data[EXAMPLE_MAX_CHAR_SIZE];
+    snprintf(data, EXAMPLE_MAX_CHAR_SIZE, "%s %s!\n", "Hello", card->cid.name);
+    ret = write_file(file_hello, data);
+    if (ret != ESP_OK) {
+        return;
+    }
+    const char *file_foo = MOUNT_POINT"/foo.txt";
+
+    // Check if destination file exists before renaming
+    struct stat st;
+    if (stat(file_foo, &st) == 0) {
+        // Delete it if it exists
+        unlink(file_foo);
+    }
+
+    // Rename original file
+    ESP_LOGI(TAG, "Renaming file %s to %s", file_hello, file_foo);
+    if (rename(file_hello, file_foo) != 0) {
+        ESP_LOGE(TAG, "Rename failed");
+        return;
+    }
+
+    ret = read_file(file_foo);
+    if (ret != ESP_OK) {
+        return;
+    }
+
+    const char *file_nihao = MOUNT_POINT"/nihao.txt";
+    memset(data, 0, EXAMPLE_MAX_CHAR_SIZE);
+    snprintf(data, EXAMPLE_MAX_CHAR_SIZE, "%s %s!\n", "Nihao", card->cid.name);
+    ret = write_file(file_nihao, data);
+    if (ret != ESP_OK) {
+        return;
+    }
+
+    //Open file for reading
+    ret = read_file(file_nihao);
+    if (ret != ESP_OK) {
+        return;
+    }
+
+    // All done, unmount partition and disable SPI peripheral
+    esp_vfs_fat_sdcard_unmount(mount_point, card);
+    ESP_LOGI(TAG, "Card unmounted");
+
+    //deinitialize the bus after all devices are removed
+    spi_bus_free(host.slot);
 
     while (1) {
         //-------------Read ADC value---------------//
@@ -131,16 +271,10 @@ void app_main(void)
             sum += sample;
         }
         adc_raw = sum / 10;
-        // ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, EXAMPLE_ADC1_CHAN0, adc_raw);
         pressure_bar = adc_raw_to_bar(adc_raw);
-        // pressure_bar = mpa_to_bar(adc_raw_to_mpa(adc_raw));
-
-        //-------------Send value via UART---------------//
-        char uart_msg[32];
-        int uart_msg_len = snprintf(uart_msg, sizeof(uart_msg), "P=%.3f\n\r", pressure_bar);
-        uart_write_bytes(uart_num, uart_msg, uart_msg_len);
+        ESP_LOGI(TAG, "ADC Raw: %d", adc_raw);
+        ESP_LOGI(TAG, "Pressure: %.2f Bar", pressure_bar);
         snprintf((char *)buffer1, sizeof(buffer1), "(Raw: %d/4095)", adc_raw);
-        // TODO: check if pressure is valid before displaying
         snprintf((char *)buffer2, sizeof(buffer2), "%.3f Bar\n", pressure_bar);
 
         //-------------Display on SSD1306---------------//
@@ -156,71 +290,4 @@ void app_main(void)
 
     //Tear Down
     ESP_ERROR_CHECK(adc_oneshot_del_unit(adc1_handle));
-    if (do_calibration1_chan0) {
-        example_adc_calibration_deinit(adc1_cali_chan0_handle);
-    }
-}
-
-/*---------------------------------------------------------------
-        ADC Calibration
----------------------------------------------------------------*/
-static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle)
-{
-    adc_cali_handle_t handle = NULL;
-    esp_err_t ret = ESP_FAIL;
-    bool calibrated = false;
-
-#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
-    if (!calibrated) {
-        ESP_LOGI(TAG, "calibration scheme version is %s", "Curve Fitting");
-        adc_cali_curve_fitting_config_t cali_config = {
-            .unit_id = unit,
-            .chan = channel,
-            .atten = atten,
-            .bitwidth = ADC_BITWIDTH_DEFAULT,
-        };
-        ret = adc_cali_create_scheme_curve_fitting(&cali_config, &handle);
-        if (ret == ESP_OK) {
-            calibrated = true;
-        }
-    }
-#endif
-
-#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
-    if (!calibrated) {
-        ESP_LOGI(TAG, "calibration scheme version is %s", "Line Fitting");
-        adc_cali_line_fitting_config_t cali_config = {
-            .unit_id = unit,
-            .atten = atten,
-            .bitwidth = ADC_BITWIDTH_DEFAULT,
-        };
-        ret = adc_cali_create_scheme_line_fitting(&cali_config, &handle);
-        if (ret == ESP_OK) {
-            calibrated = true;
-        }
-    }
-#endif
-
-    *out_handle = handle;
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Calibration Success");
-    } else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated) {
-        ESP_LOGW(TAG, "eFuse not burnt, skip software calibration");
-    } else {
-        ESP_LOGE(TAG, "Invalid arg or no memory");
-    }
-
-    return calibrated;
-}
-
-static void example_adc_calibration_deinit(adc_cali_handle_t handle)
-{
-#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
-    ESP_LOGI(TAG, "deregister %s calibration scheme", "Curve Fitting");
-    ESP_ERROR_CHECK(adc_cali_delete_scheme_curve_fitting(handle));
-
-#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
-    ESP_LOGI(TAG, "deregister %s calibration scheme", "Line Fitting");
-    ESP_ERROR_CHECK(adc_cali_delete_scheme_line_fitting(handle));
-#endif
 }
