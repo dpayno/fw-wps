@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /* ESP-IDF libraries */
 #include "freertos/FreeRTOS.h"
@@ -58,8 +59,10 @@ const static char *TAG = "WPS";
     Vmin = 0.5V → Vadc,min = 0.5 × 0.66 = 0.33V
     Vmax = 4.5V → Vadc,max = 4.5 × 0.66 = 2.97V
 */
-#define ADC_MIN               410    // Vmin,adc = 0.5V (0 MPa) --> ADCmin = 0.33V / 3.3V × 4095 ≈ 410
-#define ADC_MAX               3687   // Vmax,adc = 4.5V (1.2 MPa) --> ADCmax = 2.97V / 3.3V × 4095 ≈ 3687
+// Vmin,adc = 0.5V (0 MPa) --> ADCmin = 0.33V / 3.3V × 4095 ≈ 410
+#define ADC_MIN               410
+// Vmax,adc = 4.5V (1.2 MPa) --> ADCmax = 2.97V / 3.3V × 4095 ≈ 3687
+#define ADC_MAX               3687
 #define PRESSURE_MAX_MPA      1.2f
 
 /*---------------------------------------------------------------
@@ -83,7 +86,7 @@ static float pressure_bar;
         Function Prototypes
 ---------------------------------------------------------------*/
 static float adc_raw_to_bar(int raw);
-static esp_err_t write_file(const char *path, char *data);
+static esp_err_t write_file(const char *path, char *data, const char* type);
 static esp_err_t read_file(const char *path);
 
 /*---------------------------------------------------------------
@@ -99,10 +102,10 @@ static float adc_raw_to_bar(int raw)
     return result;
 }
 
-static esp_err_t write_file(const char *path, char *data)
+static esp_err_t write_file(const char *path, char *data, const char* type)
 {
     ESP_LOGI(TAG, "Opening file %s", path);
-    FILE *f = fopen(path, "w");
+    FILE *f = fopen(path, type);
     if (f == NULL) {
         ESP_LOGE(TAG, "Failed to open file for writing");
         return ESP_FAIL;
@@ -143,7 +146,7 @@ void app_main(void)
 {
     //-------------SSD1306 Init---------------//
     SSD1306_t dev;
-    char buffer1[30], buffer2[30];
+    char buffer1[30], buffer2[30], buffer3[64];
     i2c_master_init(&dev, CONFIG_SDA_GPIO, CONFIG_SCL_GPIO, CONFIG_RESET_GPIO);
     ssd1306_init(&dev, 128, 64);
     ssd1306_clear_screen(&dev, false);
@@ -196,71 +199,43 @@ void app_main(void)
 
     if (ret != ESP_OK) {
         if (ret == ESP_FAIL) {
-            ESP_LOGE(TAG, "Failed to mount filesystem. "
-                     "If you want the card to be formatted, set the CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED menuconfig option.");
+            ESP_LOGE(TAG, "Failed to mount filesystem. ");
         } else {
             ESP_LOGE(TAG, "Failed to initialize the card (%s). "
-                     "Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
-#ifdef CONFIG_EXAMPLE_DEBUG_PIN_CONNECTIONS
-            check_sd_card_pins(&config, pin_count);
-#endif
+                "Make sure SD card lines have pull-up resistors in place.",
+                esp_err_to_name(ret));
         }
         return;
     }
     ESP_LOGI(TAG, "Filesystem mounted");
-
-    // Card has been initialized, print its properties
     sdmmc_card_print_info(stdout, card);
 
-    // First create a file.
-    const char *file_hello = MOUNT_POINT"/hello.txt";
-    char data[EXAMPLE_MAX_CHAR_SIZE];
-    snprintf(data, EXAMPLE_MAX_CHAR_SIZE, "%s %s!\n", "Hello", card->cid.name);
-    ret = write_file(file_hello, data);
-    if (ret != ESP_OK) {
-        return;
-    }
-    const char *file_foo = MOUNT_POINT"/foo.txt";
-
-    // Check if destination file exists before renaming
+    // Create a file if it does not exist.
+    const char *file_pressure = MOUNT_POINT"/data.csv";
     struct stat st;
-    if (stat(file_foo, &st) == 0) {
-        // Delete it if it exists
-        unlink(file_foo);
-    }
-
-    // Rename original file
-    ESP_LOGI(TAG, "Renaming file %s to %s", file_hello, file_foo);
-    if (rename(file_hello, file_foo) != 0) {
-        ESP_LOGE(TAG, "Rename failed");
-        return;
-    }
-
-    ret = read_file(file_foo);
-    if (ret != ESP_OK) {
-        return;
-    }
-
-    const char *file_nihao = MOUNT_POINT"/nihao.txt";
-    memset(data, 0, EXAMPLE_MAX_CHAR_SIZE);
-    snprintf(data, EXAMPLE_MAX_CHAR_SIZE, "%s %s!\n", "Nihao", card->cid.name);
-    ret = write_file(file_nihao, data);
-    if (ret != ESP_OK) {
-        return;
-    }
-
-    //Open file for reading
-    ret = read_file(file_nihao);
-    if (ret != ESP_OK) {
-        return;
+    if (stat(file_pressure, &st) != 0) {
+        ESP_LOGI(TAG, "File %s does not exist, creating file", file_pressure);
+        char data[EXAMPLE_MAX_CHAR_SIZE];
+        snprintf(data, EXAMPLE_MAX_CHAR_SIZE, "TS, PRAW, PBAR\n");
+        ret = write_file(file_pressure, data, "w");
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create file %s", file_pressure);
+            return;
+        }
+    } else {
+        ESP_LOGI(TAG, "File %s already exists, skipping creation",
+            file_pressure);
     }
 
     // All done, unmount partition and disable SPI peripheral
     esp_vfs_fat_sdcard_unmount(mount_point, card);
     ESP_LOGI(TAG, "Card unmounted");
-
-    //deinitialize the bus after all devices are removed
     spi_bus_free(host.slot);
+
+    //-------------Main loop---------------//
+    TickType_t xLastWakeTime;
+    const TickType_t xFrequency = 10;
+    xLastWakeTime = xTaskGetTickCount();
 
     while (1) {
         //-------------Read ADC value---------------//
@@ -277,15 +252,47 @@ void app_main(void)
         snprintf((char *)buffer1, sizeof(buffer1), "(Raw: %d/4095)", adc_raw);
         snprintf((char *)buffer2, sizeof(buffer2), "%.3f Bar\n", pressure_bar);
 
+        //-------------Store data in SD card---------------//
+        ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to initialize bus.");
+            return;
+        }
+        ESP_LOGI(TAG, "Mounting filesystem");
+        ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
+        if (ret != ESP_OK) {
+            if (ret == ESP_FAIL) {
+                ESP_LOGE(TAG, "Failed to mount filesystem. ");
+            } else {
+                ESP_LOGE(TAG, "Failed to initialize the card (%s). "
+                    "Make sure SD card lines have pull-up resistors in place.",
+                    esp_err_to_name(ret));
+            }
+            return;
+        }
+        ESP_LOGI(TAG, "Filesystem mounted");
+        time_t now;
+        time(&now);
+        snprintf(buffer3, EXAMPLE_MAX_CHAR_SIZE, "%lld,%d,%.3f\n", now, adc_raw, pressure_bar);
+        ret = write_file(file_pressure, buffer3, "a");
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create file %s", file_pressure);
+            return;
+        }
+
+        // All done, unmount partition and disable SPI peripheral
+        esp_vfs_fat_sdcard_unmount(mount_point, card);
+        ESP_LOGI(TAG, "Card unmounted");
+        spi_bus_free(host.slot);
+
         //-------------Display on SSD1306---------------//
         ssd1306_clear_screen(&dev, false);
-        ssd1306_display_text(&dev, 0, "Water pressure:", 16, false);
-        ssd1306_display_text(&dev, 2, buffer1, strlen(buffer1), false);
-        ssd1306_display_text_x3(&dev, 4, buffer2, strlen(buffer2), false);
-        ssd1306_display_text(&dev, 7, "Bar", 3, false);
+        ssd1306_display_text(&dev, 0, "Water pres (Bar):", 18, false);
+        ssd1306_display_text_x3(&dev, 2, buffer2, strlen(buffer2), false);
+        ssd1306_display_text(&dev, 5, buffer1, strlen(buffer1), false);
 
         //-------------End cycle---------------//
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10000));
     }
 
     //Tear Down
